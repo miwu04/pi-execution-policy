@@ -1,18 +1,34 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { BUDGET_GUIDANCE, GrantSchema, ReviewSchema, type Config, type Grant } from "./config.ts";
+import { BUDGET_GUIDANCE, ReviewSchema, type Config, type Grant } from "./config.ts";
 import { canonical, changedFiles, inside, permitted, revision } from "./repository.ts";
 import { git, runCommand, type CommandResult } from "./process.ts";
 import { digest, readJson, saveJson, WriteLease } from "./storage.ts";
 
 type CheckRecord = { revision: string; passed: boolean; result: CommandResult; checkedAt: string };
 type ReviewRecord = { revision: string; reviewerId: string; reportPath: string; reportContent: string; verdict: "pass" | "block" };
+export type PolicyMode = "standalone" | "orchestrator" | "managed";
+export type ManagedTask = {
+  id: string; agentId: string | null; attemptId: string; cwd: string; role: string; phase: string;
+  parentAgentId?: string | null; paths?: string[]; allowCommit?: boolean; subjectTaskId?: string; subjectGeneration?: number | null;
+};
+export type OrchestrationTask = { id: string; agentId: string | null; parentAgentId?: string | null; phase: string; role: string; paths: string[]; allowCommit: boolean; error: string | null };
+export type OrchestrationState = {
+  tasks: Record<string, OrchestrationTask>;
+  messages: Record<string, { id: string; taskId: string; recipientId: string | null; status: string; body: string }>;
+};
+
+const FOREVER = "9999-12-31T00:00:00.000Z";
+const ENDED = ["accepted", "canceled", "failed", "blocked"];
+const SHELL_TOOLS = ["bash", "powershell", "windows_shell_exec", "interactive_shell"];
+// Waiting for an upstream ruling by sleeping or polling blocks the turn and hides the blocker; the plugin resumes a finished turn instead.
+const WAIT_PATTERN = /(^|[;&|(\n])\s*sleep\s+[0-9.]|\b(while|until|for|timeout)\b[^\n]*\bsleep\b|\b(inotifywait|while\s+true)\b/;
+
 export interface PolicyState {
   schemaVersion: 1; sessionId: string; actorId: string; cwd: string;
-  grant: Grant | null; toolCalls: number; initialDirty: string[]; touched: string[];
+  toolCalls: number; touched: string[];
   checks: Record<string, CheckRecord>; review: ReviewRecord | null;
-  approval: { revision: string; approvedAt: string } | null;
   lastRun: { id: string; check: string; requested: number; attempted: number; completed: number; status: "running" | "completed" | "failed" | "interrupted"; results: Array<Pick<CommandResult, "exitCode" | "timedOut" | "canceled">> } | null;
 }
 
@@ -23,6 +39,7 @@ export class PolicyController {
   readonly state: PolicyState;
   readonly lease: WriteLease;
   readonly protectedPaths: string[];
+  readonly mode: PolicyMode;
   private active = new Set<string>();
   private controlBusy = false;
   private stopped = false;
@@ -34,94 +51,72 @@ export class PolicyController {
     this.config = options.config;
     this.stateRoot = canonical(resolve(options.stateRoot));
     const actorId = options.actorId ?? options.sessionId;
+    const taskId = process.env.AGENT_POLICY_TASK_ID;
+    const attemptId = process.env.AGENT_POLICY_ATTEMPT_ID;
+    const role = process.env.AGENT_POLICY_ROLE;
+    this.mode = taskId && attemptId && role ? "managed" : options.actorId ? "orchestrator" : "standalone";
     this.statePath = join(this.stateRoot, "sessions", `${digest(options.sessionId)}.json`);
     this.protectedPaths = [this.stateRoot, ...(options.configPath ? [canonical(resolve(options.configPath))] : [])];
     const old = readJson<PolicyState>(this.statePath);
     this.state = {
       schemaVersion: 1, sessionId: options.sessionId, actorId, cwd: this.cwd,
-      grant: null, toolCalls: 0, initialDirty: [], touched: [], checks: {}, review: null, approval: null, lastRun: null,
-      ...(old?.schemaVersion === 1 && old.cwd === this.cwd && old.actorId === actorId ? { initialDirty: old.initialDirty, touched: old.touched, checks: old.checks, lastRun: old.lastRun ? { ...old.lastRun, status: old.lastRun.status === "running" ? "interrupted" : old.lastRun.status } : null } : {}),
+      toolCalls: 0, touched: [], checks: {}, review: null, lastRun: null,
+      ...(old?.schemaVersion === 1 && old.cwd === this.cwd && old.actorId === actorId ? { touched: old.touched, checks: old.checks, lastRun: old.lastRun ? { ...old.lastRun, status: old.lastRun.status === "running" ? "interrupted" : old.lastRun.status } : null } : {}),
     };
     this.lease = new WriteLease(this.stateRoot, this.cwd, `${options.sessionId}:${process.pid}:${randomUUID()}`);
     this.persist();
   }
 
-  private persist(): void { if (!this.stopped) saveJson(this.statePath, this.state); }
+  private persist(): void { if (!this.stopped && this.mode !== "standalone") saveJson(this.statePath, this.state); }
   private async control(action: () => Promise<void>): Promise<void> {
-    if (this.stopped || this.active.size || this.controlBusy) throw new Error("执行过程中不能修改授权、审查或批准；请等待当前操作退出");
+    if (this.stopped || this.active.size || this.controlBusy) throw new Error("执行过程中不能修改审查或批准；请等待当前操作退出");
     this.controlBusy = true;
     try { await action(); } finally { this.controlBusy = false; }
   }
-  private authorized(): Grant {
+  private task(): ManagedTask | undefined {
+    const taskId = process.env.AGENT_POLICY_TASK_ID;
+    if (!taskId) return undefined;
+    return readJson<{ tasks: Record<string, ManagedTask> }>(join(this.stateRoot, "orchestration.json"))?.tasks[taskId];
+  }
+  // Re-read on every call: revocation, a new attempt, or a closed phase must take effect immediately.
+  private scope(): Grant {
     if (this.stopped) throw new Error("执行会话已经关闭");
-    const grant = this.state.grant;
-    if (!grant || Date.parse(grant.expiresAt) <= Date.now()) throw new Error("缺少有效授权；请由用户通过 /policy grant 登记范围和有效期");
-    if (process.env.AGENT_POLICY_ROLE && process.env.AGENT_POLICY_ROLE !== "worker") throw new Error("当前只读角色不允许进入写入阶段");
-    return grant;
+    if (this.mode !== "managed") throw new Error("当前模式没有角色范围");
+    const attemptId = process.env.AGENT_POLICY_ATTEMPT_ID;
+    const task = this.task();
+    if (!task) throw new Error("编排插件没有记录当前任务；按只读处理");
+    if (task.agentId !== this.state.actorId || task.attemptId !== attemptId) throw new Error("任务执行阶段已经变化；拒绝写入");
+    if (canonical(resolve(task.cwd)) !== this.cwd) throw new Error("任务工作目录与本会话不一致；拒绝写入");
+    if (ENDED.includes(task.phase)) throw new Error(`任务阶段已经结束：${task.phase}`);
+    if (task.role !== "worker") throw new Error(`当前角色 ${task.role} 不允许写入`);
+    if (!task.paths?.length) throw new Error("派发方没有声明写入路径");
+    return { paths: task.paths, allowCommit: Boolean(task.allowCommit), allowExisting: true, expiresAt: FOREVER };
   }
   private claim(id: string): void {
-    this.authorized();
-    if (this.active.size || this.controlBusy) throw new Error("该目录正在执行写入、检查或授权登记；必须串行执行");
+    if (this.mode === "managed") this.scope();
+    if (this.active.size || this.controlBusy) throw new Error("该目录正在执行写入或检查；必须串行执行");
     if (existsSync(join(this.stateRoot, "freezes", `${digest(this.cwd)}.json`))) throw new Error("该目录正在独立审查；待审查完成并登记处理结果后才能写入或运行检查");
     this.lease.acquire();
     this.active.add(id);
   }
-  private path(path: string): string {
-    const grant = this.authorized();
-    const name = permitted(this.cwd, path, grant.paths, this.protectedPaths);
-    if (!grant.allowExisting && this.state.initialDirty.includes(name)) throw new Error("目标包含授权前已有改动；需要用户明确接纳这些改动");
-    return name;
-  }
-
-  async grant(input: unknown): Promise<void> {
-    return this.control(async () => {
-    const grant = GrantSchema.parse(input);
-    if (Date.parse(grant.expiresAt) <= Date.now()) throw new Error("授权有效期必须晚于当前时间");
-    if (process.env.AGENT_POLICY_ROLE && process.env.AGENT_POLICY_ROLE !== "worker") throw new Error("当前只读角色不能申请写入授权");
-    if (!existsSync(join(this.cwd, ".git"))) throw new Error("写入与检查授权需要在 Git 仓库根目录登记");
-    await revision(this.cwd, this.config);
-    for (const path of grant.paths) permitted(this.cwd, path, grant.paths, this.protectedPaths);
-    this.state.initialDirty = await changedFiles(this.cwd);
-    this.state.grant = grant;
-    this.state.toolCalls = 0;
-    this.state.review = null;
-    this.state.approval = null;
-    this.persist();
-    });
-  }
-
-  revoke(): void {
-    if (this.active.size || this.controlBusy) throw new Error("执行过程中不能释放写入归属；先停止并等待命令退出");
-    this.state.grant = null;
-    this.state.approval = null;
-    this.lease.release();
-    this.persist();
+  private path(target: string): string {
+    if (this.mode !== "managed") return permitted(this.cwd, target, ["."], this.protectedPaths);
+    return permitted(this.cwd, target, this.scope().paths, this.protectedPaths);
   }
 
   gate(id: string, toolName: string, input: Record<string, unknown>): void {
-    if (this.state.grant) {
-      const limit = this.state.grant.maxToolCalls;
-      if (limit !== undefined && this.state.toolCalls >= limit && !["policy_status", "policy_ack", "policy_request_decision"].includes(toolName)) {
-        throw new Error("已达到用户设置的工具调用上限；需要报告剩余工作，不得降低完成标准");
-      }
-      this.state.toolCalls++;
-      this.persist();
+    if (this.mode !== "managed") return;
+    if (SHELL_TOOLS.includes(toolName) && typeof input.command === "string" && WAIT_PATTERN.test(input.command)) {
+      throw new Error("受编排的 agent 不能用 sleep 或轮询等待上游；结束当前回合，在报告里写清阻塞点、已有证据和需要的答案，上游会用 continue 把结论送回");
     }
-    if (["policy_status", "policy_git", "policy_remove", "policy_ack", "policy_request_decision", "policy_check", "policy_repeat", "policy_commit"].includes(toolName)) return;
-    if (toolName === "codemode") return; // Nested tool calls still pass through this gate.
-    if (toolName === "write" || toolName === "edit") {
-      if (typeof input.path !== "string") throw new Error("写入工具缺少明确路径");
-      const path = this.path(input.path);
-      this.claim(id);
-      this.state.review = null;
-      this.state.approval = null;
-      if (!this.state.touched.includes(path)) this.state.touched.push(path);
-      this.persist();
-      return;
-    }
-    if (this.config.readTools.includes(toolName)) return;
-    if (toolName === "ask_user_question" && !process.env.AGENT_POLICY_TASK_ID) return;
-    throw new Error(`执行入口未获授权：${toolName}；原始 shell、外部写入和未知 MCP 工具默认拒绝`);
+    if (!["write", "edit", "policy_remove", "policy_commit"].includes(toolName)) return;
+    if (toolName !== "write" && toolName !== "edit") return;
+    if (typeof input.path !== "string") throw new Error("写入工具缺少明确路径");
+    const path = this.path(input.path);
+    this.claim(id);
+    this.state.review = null;
+    if (!this.state.touched.includes(path)) this.state.touched.push(path);
+    this.persist();
   }
 
   async inspectGit(operation: "status" | "diff" | "log" | "show" | "head", paths: string[] = [], ref = "HEAD", limit = 20): Promise<string> {
@@ -147,7 +142,7 @@ export class PolicyController {
       const stat = lstatSync(target);
       if (!stat.isFile() && !stat.isSymbolicLink()) throw new Error("只允许删除明确授权的单个文件，不递归删除目录");
       unlinkSync(target);
-      this.state.review = null; this.state.approval = null;
+      this.state.review = null;
       if (!this.state.touched.includes(name)) this.state.touched.push(name);
       this.persist();
     } finally { this.finishTool(id); }
@@ -155,7 +150,7 @@ export class PolicyController {
 
   finishTool(id: string): void {
     this.active.delete(id);
-    if (this.stopped && !this.active.size) this.lease.release();
+    if (!this.active.size) this.lease.release();
   }
 
   async check(key: string, count = 1, signal?: AbortSignal): Promise<{ runs: CommandResult[]; passed: number; failed: number }> {
@@ -165,18 +160,16 @@ export class PolicyController {
     if (!Number.isInteger(count) || count < 1 || count > this.config.maxRepeatRuns) throw new Error("运行次数超出配置范围");
     const id = randomUUID();
     this.claim(id);
-    this.state.approval = null;
     const runs: CommandResult[] = [];
     this.state.lastRun = { id, check: key, requested: count, attempted: 0, completed: 0, status: "running", results: [] };
     this.persist();
     try {
       const before = await revision(this.cwd, this.config);
       for (let i = 0; i < count; i++) {
-        this.authorized();
         if (signal?.aborted) throw new Error("检查已取消");
         this.state.lastRun.attempted++;
         this.persist();
-        const result = await runCommand(spec.command, spec.args, this.cwd, { signal, timeoutMs: Math.min(spec.timeoutMs, Date.parse(this.authorized().expiresAt) - Date.now()) });
+        const result = await runCommand(spec.command, spec.args, this.cwd, { signal, timeoutMs: spec.timeoutMs });
         runs.push(result);
         this.state.lastRun.completed++;
         this.state.lastRun.results.push({ exitCode: result.exitCode, timedOut: result.timedOut, canceled: result.canceled });
@@ -187,7 +180,7 @@ export class PolicyController {
       const passed = runs.filter(run => run.exitCode === 0 && !run.canceled && !run.timedOut).length;
       this.state.checks[key] = { revision: before, passed: before === after && passed === count && runs.length === count, result: runs.at(-1)!, checkedAt: new Date().toISOString() };
       this.state.lastRun.status = this.state.checks[key].passed ? "completed" : "failed";
-      if (before !== after) { this.state.review = null; this.state.approval = null; }
+      if (before !== after) this.state.review = null;
       this.persist();
       return { runs, passed, failed: runs.length - passed };
     } catch (error) {
@@ -198,36 +191,34 @@ export class PolicyController {
     } finally { this.finishTool(id); }
   }
 
+  // A reviewer session publishes its verdict for the task it reviewed, so the dispatcher can consume evidence instead of a claim.
   async recordReview(input: unknown): Promise<void> {
     return this.control(async () => {
-    this.authorized();
-    this.lease.acquire();
     const review = ReviewSchema.parse(input);
     if ([this.state.actorId, this.state.sessionId].includes(review.reviewerId)) throw new Error("审查者不能是当前实现者");
     const reportPath = realpathSync(resolve(this.cwd, review.reportPath));
     const report = readFileSync(reportPath, "utf8");
     if (!report.trim()) throw new Error("审查报告为空");
     this.state.review = { ...review, reportPath, reportContent: digest(report), revision: await revision(this.cwd, this.config) };
-    this.state.approval = null;
+    const task = this.task();
+    if (this.mode === "managed" && task?.role === "reviewer" && task.subjectTaskId) {
+      saveJson(join(this.stateRoot, "reviews", `${task.subjectTaskId}.json`), {
+        subjectTaskId: task.subjectTaskId, reviewerTaskId: task.id, reviewerAgentId: task.agentId,
+        subjectGeneration: task.subjectGeneration ?? null, verdict: review.verdict, reportPath, reportDigest: this.state.review.reportContent,
+        revision: this.state.review.revision, recordedAt: new Date().toISOString(),
+      });
+    }
     this.persist();
     });
   }
 
-  async approve(): Promise<void> {
-    return this.control(async () => {
-    if (!this.authorized().allowCommit) throw new Error("当前授权不包含提交");
-    this.lease.acquire();
-    const current = await revision(this.cwd, this.config);
-    const review = this.state.review;
-    if (!review || review.verdict !== "pass" || review.revision !== current || digest(readFileSync(review.reportPath)) !== review.reportContent) {
-      throw new Error("缺少对应当前内容的通过审查报告");
-    }
-    const missing = this.config.requiredChecks.filter(key => !this.state.checks[key]?.passed || this.state.checks[key]?.revision !== current);
-    if (missing.length) throw new Error(`缺少适用的通过结果：${missing.join(", ")}`);
-    for (const path of await changedFiles(this.cwd)) this.path(path);
-    this.state.approval = { revision: current, approvedAt: new Date().toISOString() };
-    this.persist();
-    });
+  // Commit approval is written by the dispatcher and bound to one attempt, revision and path set.
+  private approval(): { attemptId: string; revision: string; paths: string[] } | null {
+    const taskId = process.env.AGENT_POLICY_TASK_ID;
+    if (!taskId) return null;
+    const record = readJson<{ attemptId: string; revision: string; paths: string[] }>(join(this.stateRoot, "approvals", `${taskId}.json`));
+    if (!record || record.attemptId !== process.env.AGENT_POLICY_ATTEMPT_ID) return null;
+    return record;
   }
 
   async commit(paths: string[], message: string, signal?: AbortSignal): Promise<string> {
@@ -236,32 +227,90 @@ export class PolicyController {
     const id = randomUUID();
     this.claim(id);
     try {
-      const approved = this.state.approval?.revision;
-      if (!this.authorized().allowCommit || !approved || approved !== await revision(this.cwd, this.config)) throw new Error("提交批准缺失或已因内容变化失效");
-      const review = this.state.review;
-      if (!review || digest(readFileSync(review.reportPath)) !== review.reportContent) throw new Error("审查报告已经变化，需要重新批准");
       const approvedPaths = [...new Set(paths.map(path => this.path(path)))];
-      const changed = await changedFiles(this.cwd);
-      if (changed.length !== approvedPaths.length || changed.some(path => !approvedPaths.includes(path))) throw new Error("提交必须覆盖当前已审查的完整改动；独立行为需分开实现、审查和批准");
-      for (const path of approvedPaths) {
-        if (!this.state.touched.includes(path) && !this.authorized().allowExisting) throw new Error(`不是当前实现者登记的改动：${path}`);
+      const current = await revision(this.cwd, this.config);
+      if (this.mode === "managed") {
+        const scope = this.scope();
+        if (!scope.allowCommit) throw new Error("派发方没有授予提交权限");
+        const approval = this.approval();
+        if (!approval) throw new Error("缺少派发方对当前执行阶段的提交批准");
+        if (approval.revision !== current) throw new Error("提交批准已因内容变化失效");
+        if (approvedPaths.some(path => !approval.paths.includes(path))) throw new Error("提交路径超出已批准的集合");
       }
+      const changed = await changedFiles(this.cwd);
+      if (changed.length !== approvedPaths.length || changed.some(path => !approvedPaths.includes(path))) throw new Error("提交必须覆盖当前完整改动；独立行为需分开实现和提交");
       if ((await git(this.cwd, ["diff", "--cached", "--name-only"], signal)).trim()) throw new Error("暂存区已有内容；请先明确其归属，不自动纳入提交");
       await git(this.cwd, ["config", "user.name"], signal);
       await git(this.cwd, ["config", "user.email"], signal);
       await git(this.cwd, ["add", "--", ...approvedPaths], signal);
-      if (approved !== await revision(this.cwd, this.config)) throw new Error("暂存过程中内容变化，提交已停止");
+      const staged = (await git(this.cwd, ["diff", "--cached", "--name-only"], signal)).split("\n").filter(Boolean).sort();
+      if (staged.join("\0") !== [...approvedPaths].sort().join("\0")) throw new Error("暂存内容与批准路径不一致，提交已停止");
       const expectedTree = (await git(this.cwd, ["write-tree"], signal)).trim();
       await git(this.cwd, ["commit", "-m", message], signal);
       const actualTree = (await git(this.cwd, ["rev-parse", "HEAD^{tree}"], signal)).trim();
       if (actualTree !== expectedTree) throw new Error("提交钩子改变了暂存内容；停止后续操作，需要检查已有提交");
       this.state.touched = this.state.touched.filter(path => !approvedPaths.includes(path));
       return (await git(this.cwd, ["rev-parse", "HEAD"], signal)).trim();
-    } finally {
-      this.state.approval = null;
-      this.persist();
-      this.finishTool(id);
-    }
+    } finally { this.persist(); this.finishTool(id); }
+  }
+
+  orchestration(): OrchestrationState | null {
+    return readJson<OrchestrationState>(join(this.stateRoot, "orchestration.json"));
+  }
+
+  visibleTasks(): OrchestrationTask[] {
+    const state = this.orchestration();
+    if (!state) return [];
+    return Object.values(state.tasks).filter(task => this.mode === "managed" ? task.id === process.env.AGENT_POLICY_TASK_ID : true);
+  }
+
+  orchestrationStatus(): { mode: PolicyMode; tasks: OrchestrationTask[]; messages: Array<{ id: string; taskId: string; status: string; body: string }>; results: Array<{ id: string; text?: string; error?: string }> } {
+    const state = this.orchestration();
+    const tasks = this.visibleTasks();
+    const ids = new Set(tasks.map(task => task.id));
+    const messages = Object.values(state?.messages ?? {}).filter(message => ids.has(message.taskId) && (this.mode !== "managed" || message.recipientId === this.state.actorId || message.status === "awaiting_operator")).map(({ id, taskId, status, body }) => ({ id, taskId, status, body }));
+    const results = readdirSync(join(this.stateRoot, "results"), { withFileTypes: true }).filter(entry => entry.isFile() && entry.name.endsWith(".json")).sort().slice(-20).flatMap(entry => {
+      const value = readJson<{ id: string; text?: string; error?: string }>(join(this.stateRoot, "results", entry.name));
+      return value ? [value] : [];
+    });
+    return { mode: this.mode, tasks, messages, results };
+  }
+
+  // Dispatch belongs to the top layer: standalone Pi without Paseo refuses instead of writing unread requests.
+  orchestrate(input: string): string {
+    if (this.mode === "standalone") throw new Error("当前没有连接 Paseo；不能创建编排请求");
+    if (!existsSync(join(this.stateRoot, "sessions"))) throw new Error("编排状态目录不可写");
+    let action: Record<string, unknown>;
+    try { action = JSON.parse(input) as Record<string, unknown>; } catch { throw new Error("编排操作不是有效 JSON"); }
+    const task = this.task();
+    if (this.mode === "managed" && !["orchestrator", "lane"].includes(task?.role ?? "")) throw new Error("当前角色不能派发或管理其他任务");
+    const id = randomUUID();
+    saveJson(join(this.stateRoot, "requests", `${id}.json`), { id, actorId: this.state.actorId, taskId: task?.id ?? null, attemptId: task?.attemptId ?? null, action });
+    return id;
+  }
+
+  // Peer messages coordinate siblings; they are never authorization, a ruling, or a handoff of ownership.
+  messagePeer(toTaskId: string, body: string): string {
+    if (this.mode !== "managed") throw new Error("只有受编排管理的 agent 可以向同级发消息");
+    const sender = this.task();
+    if (!sender) throw new Error("当前会话未绑定编排任务");
+    const target = this.orchestration()?.tasks[toTaskId];
+    if (!target) throw new Error("目标任务不存在");
+    if (target.id === sender.id) throw new Error("不能给自己发消息");
+    if ((target.parentAgentId ?? null) !== (sender.parentAgentId ?? null)) throw new Error("只能与同一上游下的同级任务通信");
+    if (!body.trim() || body.length > 16384) throw new Error("消息为空或过长");
+    const id = randomUUID();
+    saveJson(join(this.stateRoot, "requests", `${id}.json`), { id, actorId: this.state.actorId, taskId: sender.id, attemptId: sender.attemptId, action: { action: "message", toTaskId, body } });
+    return id;
+  }
+
+  requestDecision(message: string): string {
+    const task = this.task();
+    if (!task || task.agentId !== this.state.actorId || ENDED.includes(task.phase)) throw new Error("当前会话未绑定有效的编排任务");
+    if (!message.trim() || message.length > 16384) throw new Error("请求内容为空或过长");
+    const id = randomUUID();
+    saveJson(join(this.stateRoot, "requests", `${id}.json`), { id, taskId: task.id, attemptId: task.attemptId, actorId: this.state.actorId, message, createdAt: new Date().toISOString() });
+    return id;
   }
 
   inbox(): Array<{ id: string; body: string }> {
@@ -281,38 +330,30 @@ export class PolicyController {
     saveJson(join(this.stateRoot, "acks", `${id}.json`), { recipientId: this.state.actorId, acknowledgedAt: new Date().toISOString() });
   }
 
-  requestDecision(message: string): string {
-    const binding = readJson<{ taskId: string; attemptId: string }>(join(this.stateRoot, "bindings", `${digest(this.state.actorId)}.json`));
-    const taskId = binding?.taskId ?? process.env.AGENT_POLICY_TASK_ID;
-    const attemptId = binding?.attemptId ?? process.env.AGENT_POLICY_ATTEMPT_ID;
-    if (!taskId || !attemptId || !/^[a-f0-9-]+$/.test(taskId) || !/^[a-f0-9-]+$/.test(attemptId)) throw new Error("当前会话未绑定插件管理的上游任务");
-    const task = readJson<{ tasks: Record<string, { agentId: string; attemptId: string; phase: string }> }>(join(this.stateRoot, "orchestration.json"))?.tasks[taskId];
-    if (!task || task.agentId !== this.state.actorId || task.attemptId !== attemptId || ["accepted", "canceled"].includes(task.phase)) throw new Error("上游任务已结束或当前执行阶段不匹配");
-    if (!message.trim() || message.length > 16384) throw new Error("请求内容为空或过长");
-    const id = randomUUID();
-    saveJson(join(this.stateRoot, "requests", `${id}.json`), { id, taskId, attemptId, actorId: this.state.actorId, message, createdAt: new Date().toISOString() });
-    return id;
-  }
-
   async context(): Promise<string> {
     let current: string | null = null;
     let statusError: string | null = null;
     try { if (existsSync(join(this.cwd, ".git"))) current = await revision(this.cwd, this.config); }
     catch (error) { statusError = String(error); }
-    return JSON.stringify({ collectedAt: new Date().toISOString(), actorId: this.state.actorId, cwd: this.cwd, grant: this.state.grant, authorizationValid: Boolean(!this.stopped && this.state.grant && Date.parse(this.state.grant.expiresAt) > Date.now()), limits: { maxRepeatRuns: this.config.maxRepeatRuns }, toolCalls: this.state.toolCalls, lastRun: this.state.lastRun, statusError, checks: Object.fromEntries(Object.entries(this.state.checks).map(([key, result]) => [key, { passed: result.passed && result.revision === current, checkedAt: result.checkedAt }])), inbox: this.inbox(), guidance: BUDGET_GUIDANCE });
+    const task = this.task();
+    return JSON.stringify({
+      collectedAt: new Date().toISOString(), mode: this.mode, cwd: this.cwd,
+      task: task ? { id: task.id, role: task.role, phase: task.phase, paths: task.paths ?? [], allowCommit: Boolean(task.allowCommit) } : null,
+      limits: { maxRepeatRuns: this.config.maxRepeatRuns }, toolCalls: this.state.toolCalls, lastRun: this.state.lastRun, statusError,
+      checks: Object.fromEntries(Object.entries(this.state.checks).map(([key, result]) => [key, { passed: result.passed && result.revision === current, checkedAt: result.checkedAt }])),
+      inbox: this.inbox(), guidance: BUDGET_GUIDANCE,
+    });
   }
 
   async incomplete(): Promise<string[]> {
-    if (!this.state.grant || !this.state.touched.length) return [];
+    if (this.mode !== "managed" || !this.state.touched.length) return [];
     const current = await revision(this.cwd, this.config);
     const missing = this.config.requiredChecks.filter(key => !this.state.checks[key]?.passed || this.state.checks[key]?.revision !== current);
-    return [...missing.map(key => `检查未通过或结果已失效：${key}`), ...(!this.state.review || this.state.review.verdict !== "pass" || this.state.review.revision !== current ? ["当前改动尚未登记通过的独立审查"] : [])];
+    return missing.map(key => `检查未通过或结果已失效：${key}`);
   }
 
   shutdown(): void {
     this.lifecycle.abort();
-    this.state.grant = null;
-    this.state.approval = null;
     this.persist();
     this.stopped = true;
     if (!this.active.size) this.lease.release();

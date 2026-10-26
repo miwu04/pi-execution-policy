@@ -22,11 +22,12 @@ export default function contribute(pi: ExtensionAPI) {
         stateRoot: process.env.AGENT_POLICY_STATE_DIR ?? join(homedir(), ".local", "state", "agent-policy"),
         sessionId: ctx.sessionManager.getSessionId(), actorId: process.env.PASEO_AGENT_ID,
       });
-      ctx.ui.setStatus("execution-policy", "执行约束：只读，等待明确授权");
+      const label = policy.mode === "managed" ? "受编排角色约束" : policy.mode === "orchestrator" ? "顶层编排" : "独立运行";
+      ctx.ui.setStatus("execution-policy", `执行约束：${label}`);
     } catch (error) {
       policy = undefined;
       startupError = String(error);
-      ctx.ui.notify(`执行约束初始化失败，工具执行已停止：${startupError}`, "error");
+      ctx.ui.notify(`执行约束初始化失败：${startupError}`, "error");
     }
   });
 
@@ -35,7 +36,6 @@ export default function contribute(pi: ExtensionAPI) {
     catch (error) { return { block: true, reason: String(error) }; }
   });
   pi.on("tool_result", event => { policy?.finishTool(event.toolCallId); });
-  pi.on("user_bash", () => { throw new Error("受控会话不执行原始 shell；请使用已登记检查，或在独立终端明确执行人工操作"); });
   pi.on("before_agent_start", () => { reminded = false; });
   pi.on("context", async event => ({
     messages: [...event.messages.filter(message => !(message.role === "custom" && message.customType === "execution-policy-state")), {
@@ -49,34 +49,30 @@ export default function contribute(pi: ExtensionAPI) {
     if (!issues.length) return;
     reminded = true;
     return {
-      entries: [{ type: "custom_message" as const, customType: "execution-policy-incomplete", content: `执行记录未满足交付条件：${issues.join("；")}。缺少用户授权或独立审查时应报告阻塞，不得自行批准。`, display: true }],
+      entries: [{ type: "custom_message" as const, customType: "execution-policy-incomplete", content: `执行记录未满足交付条件：${issues.join("；")}。`, display: true }],
       continue: event.context.canContinue && issues.some(issue => issue.startsWith("检查")),
     };
   });
   pi.on("session_shutdown", () => { policy?.shutdown(); policy = undefined; });
 
   pi.registerCommand("policy", {
-    description: "status | grant <JSON> | review <JSON> | approve | revoke | ack <消息编号>；仅用户命令登记授权与审查",
+    description: "status | review <JSON> | ack <消息编号>；只读查看与审查登记",
     handler: async (args, ctx) => {
       const split = args.indexOf(" ");
       const action = split < 0 ? args.trim() : args.slice(0, split);
       const body = split < 0 ? "" : args.slice(split + 1).trim();
       const controller = current();
       try {
-        if (action === "grant") await controller.grant(JSON.parse(body));
-        else if (action === "review") await controller.recordReview(JSON.parse(body));
-        else if (action === "approve") await controller.approve();
-        else if (action === "revoke") controller.revoke();
+        if (action === "review") await controller.recordReview(JSON.parse(body));
         else if (action === "ack") controller.acknowledge(body);
-        else if (action && action !== "status") throw new Error("未知操作；使用 status、grant、review、approve、revoke 或 ack");
+        else if (action && action !== "status") throw new Error("未知操作；使用 status、review 或 ack");
         ctx.ui.notify(await controller.context(), "info");
-        ctx.ui.setStatus("execution-policy", controller.state.grant ? "执行约束：已登记有限授权" : "执行约束：只读");
       } catch (error) { ctx.ui.notify(String(error), "error"); }
     },
   });
 
   pi.registerTool({
-    name: "policy_status", label: "执行约束状态", description: "读取当前授权、实际计数及上游未确认消息。",
+    name: "policy_status", label: "执行约束状态", description: "读取当前运行模式、角色范围、实际检查结果和未确认消息。",
     parameters: Type.Object({}), async execute() { return reply(await current().context()); },
   });
   pi.registerTool({
@@ -85,9 +81,23 @@ export default function contribute(pi: ExtensionAPI) {
     async execute(_id, params) { current().acknowledge(params.messageId); return reply({ acknowledged: params.messageId }); },
   });
   pi.registerTool({
-    name: "policy_request_decision", label: "向上游请求裁决", description: "向已绑定的 Paseo 任务上游发送自包含问题；不能自行扩大授权。",
+    name: "policy_message_peer", label: "给同级任务发消息", description: "向同一上游下的另一个受管任务发送事实或接口信息。同级消息不是裁决、不是授权，也不改变对方的任务合同。",
+    parameters: Type.Object({ toTaskId: Type.String({ minLength: 1 }), message: Type.String({ minLength: 1, maxLength: 16_384 }) }),
+    async execute(_id, params) { return reply({ requestId: current().messagePeer(params.toTaskId, params.message), status: "queued" }); },
+  });
+  pi.registerTool({
+    name: "policy_request_decision", label: "向上游请求裁决", description: "向绑定任务的上游发送自包含问题；不能自行扩大授权。",
     parameters: Type.Object({ message: Type.String({ minLength: 1, maxLength: 16_384 }) }),
-    async execute(_id, params) { return reply({ requestId: current().requestDecision(params.message), status: "awaiting_upstream" }); },
+    async execute(_id, params) { return reply({ requestId: current().requestDecision(params.message), status: "queued" }); },
+  });
+  pi.registerTool({
+    name: "policy_orchestration", label: "受控编排操作", description: "向 Paseo 编排插件提交任务创建、续跑、审查、验收、撤销或回执请求。输入必须是编排操作 JSON。",
+    parameters: Type.Object({ input: Type.String({ minLength: 2, maxLength: 65_536 }) }),
+    async execute(_id, params) { return reply({ requestId: current().orchestrate(params.input), status: "queued" }); },
+  });
+  pi.registerTool({
+    name: "policy_orchestration_status", label: "读取编排状态", description: "读取当前模式下的任务、消息和控制请求结果。",
+    parameters: Type.Object({}), async execute() { return reply(current().orchestrationStatus()); },
   });
   pi.registerTool({
     name: "policy_git", label: "只读 Git 查询", description: "使用固定只读操作查看状态、差异、历史、提交或当前版本，不接受任意 Git 参数。",
@@ -116,7 +126,7 @@ export default function contribute(pi: ExtensionAPI) {
     },
   });
   pi.registerTool({
-    name: "policy_commit", label: "提交已批准改动", description: "只提交明确列出的路径；要求独立审查、适用检查和用户对当前内容的明确批准。不推送、不改写已有提交。",
+    name: "policy_commit", label: "提交改动", description: "只提交明确列出的路径；受编排约束时还要求派发方给出绑定当前内容的提交批准。不推送、不改写已有提交。",
     parameters: Type.Object({ paths: Type.Array(Type.String(), { minItems: 1 }), message: Type.String({ minLength: 1 }) }),
     async execute(_id, params, signal) { return reply({ commit: await current().commit(params.paths, params.message, signal) }); },
   });
