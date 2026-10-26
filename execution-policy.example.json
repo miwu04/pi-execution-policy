@@ -1,0 +1,32 @@
+{
+  "checks": {
+    "typecheck": {
+      "command": "npm",
+      "args": [
+        "run",
+        "typecheck"
+      ],
+      "timeoutMs": 300000
+    },
+    "test": {
+      "command": "npm",
+      "args": [
+        "test"
+      ],
+      "timeoutMs": 300000
+    }
+  },
+  "requiredChecks": [
+    "typecheck",
+    "test"
+  ],
+  "environmentFiles": [
+    "package-lock.json"
+  ],
+  "environmentKeys": [
+    "PATH",
+    "NODE_ENV",
+    "CI"
+  ],
+  "maxRepeatRuns": 100
+}
